@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GPS移動距離測定器</title>
+    <style>
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; 
+            padding: 20px; 
+            max-width: 600px; 
+            margin: 0 auto; 
+            color: #333; 
+            background-color: #f8f9fa;
+        }
+        h2 { text-align: center; margin-bottom: 15px; }
+        .dashboard { 
+            background: #ffffff; 
+            border-radius: 16px; 
+            padding: 24px 16px; 
+            text-align: center; 
+            margin-bottom: 20px; 
+            box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+            border: 1px solid #e9ecef;
+        }
+        .metric-label { font-size: 14px; color: #6c757d; font-weight: bold; }
+        .metric-value { font-size: 44px; font-weight: bold; color: #1a73e8; margin: 8px 0; }
+        .status-badge { 
+            display: inline-block; 
+            padding: 6px 16px; 
+            border-radius: 20px; 
+            font-size: 14px; 
+            background: #e9ecef; 
+            color: #495057;
+            font-weight: bold; 
+        }
+        .status-active { background: #e6f4ea; color: #137333; }
+        .status-error { background: #fce8e6; color: #c5221f; }
+        
+        .btn-group { display: flex; justify-content: center; gap: 8px; margin-bottom: 15px; }
+        button { 
+            flex: 1;
+            padding: 14px 0; 
+            font-size: 16px; 
+            border: none; 
+            border-radius: 10px; 
+            cursor: pointer; 
+            font-weight: bold; 
+            transition: opacity 0.2s; 
+            max-width: 120px;
+        }
+        button:disabled { opacity: 0.35; cursor: not-allowed; }
+        #startBtn { background-color: #1a73e8; color: white; }
+        #pauseBtn { background-color: #f9ab00; color: white; }
+        #stopBtn { background-color: #d93025; color: white; }
+        
+        #log { 
+            width: 100%; 
+            height: 250px; 
+            font-family: monospace; 
+            font-size: 12px; 
+            box-sizing: border-box; 
+            border: 1px solid #ced4da; 
+            border-radius: 8px; 
+            padding: 10px; 
+            background-color: #ffffff;
+            resize: none;
+        }
+    </style>
+</head>
+<body>
+
+    <h2>GPS移動距離測定</h2>
+
+    <div class="dashboard">
+        <div class="metric-label">合計移動距離</div>
+        <div class="metric-value" id="displayDistance">0.0 m</div>
+        <div>ステータス: <span id="status" class="status-badge">停止中</span></div>
+    </div>
+
+    <div class="btn-group">
+        <button id="startBtn">スタート</button>
+        <button id="pauseBtn" disabled>一時停止</button>
+        <button id="stopBtn" disabled>ストップ</button>
+    </div>
+
+    <textarea id="log" readonly placeholder="ここに10秒おきの測定ログが表示されます..."></textarea>
+
+<script>
+    let watchId = null;       
+    let timerId = null;       
+    let wakeLock = null;
+    
+    let lastPos = null;       
+    let currentPos = null;    
+    let totalDistance = 0;    
+
+    // 設定値
+    const MIN_ACCURACY = 30; // 許容するGPS誤差(m)。これより粗いデータは除外
+    const MIN_MOVEMENT = 3;  // ノイズフィルター：3m未満の微小なブレ移動は無視
+
+    const logArea = document.getElementById('log');
+    const displayDist = document.getElementById('displayDistance');
+    const statusEl = document.getElementById('status');
+
+    // 距離計算 (Haversine formula)
+    function getDistance(lat1, lon1, lat2, lon2) {
+        const R = 6371000; 
+        const dLat = (lat2 - lat1) * Math.PI / 180;
+        const dLon = (lon2 - lon1) * Math.PI / 180;
+        const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                  Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                  Math.sin(dLon/2) * Math.sin(dLon/2);
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    }
+
+    // 表示用フォーマット (m と km を自動切換)
+    function formatDistance(meters) {
+        if (meters >= 1000) {
+            return (meters / 1000).toFixed(2) + " km";
+        }
+        return meters.toFixed(1) + " m";
+    }
+
+    // 画面のスリープ防止（Keep Awake）
+    async function requestWakeLock() {
+        if ('wakeLock' in navigator) {
+            try {
+                wakeLock = await navigator.wakeLock.request('screen');
+            } catch (err) {
+                console.log("Wake Lock エラー:", err.message);
+            }
+        }
+    }
+
+    function releaseWakeLock() {
+        if (wakeLock) {
+            wakeLock.release();
+            wakeLock = null;
+        }
+    }
+
+    // GPS取得成功時
+    function successGPS(position) {
+        if (position.coords.accuracy <= MIN_ACCURACY) {
+            currentPos = position.coords;
+        } else {
+            console.warn(`低精度のためスキップ (誤差: ${position.coords.accuracy.toFixed(1)}m)`);
+        }
+    }
+
+    // GPS取得エラー時
+    function errorGPS(err) {
+        console.error("GPSエラー:", err);
+        let msg = "";
+        switch(err.code) {
+            case 1: msg = "位置情報が許可されていません"; break;
+            case 2: msg = "位置情報が取得できません"; break;
+            case 3: msg = "タイムアウトしました"; break;
+            default: msg = "不明なエラー";
+        }
+        
+        statusEl.textContent = "エラー: " + msg;
+        statusEl.className = "status-badge status-error";
+        appendLog(`[GPSエラー] Code: ${err.code} | ${msg}`);
+    }
+
+    function appendLog(text) {
+        logArea.value += `${text}\n`;
+        logArea.scrollTop = logArea.scrollHeight;
+    }
+
+    // スタートボタン
+    document.getElementById('startBtn').onclick = () => {
+        if (!navigator.geolocation) { alert("お使いのブラウザはGPS非対応です"); return; }
+        
+        statusEl.textContent = "測定中";
+        statusEl.className = "status-badge status-active";
+        document.getElementById('startBtn').disabled = true;
+        document.getElementById('pauseBtn').disabled = false;
+        document.getElementById('stopBtn').disabled = false;
+
+        // 再スタート時の跳ね加算防止
+        lastPos = null;
+
+        requestWakeLock();
+
+        // 初回位置の取得
+        navigator.geolocation.getCurrentPosition((position) => {
+            if (position.coords.accuracy <= MIN_ACCURACY) {
+                currentPos = position.coords;
+            }
+            appendLog(`[測定開始] GPSの捕捉を開始しました。`);
+            
+            // リアルタイム監視開始
+            if (!watchId) {
+                watchId = navigator.geolocation.watchPosition(successGPS, errorGPS, {
+                    enableHighAccuracy: true,
+                    maximumAge: 0,
+                    timeout: 10000
+                });
+            }
+        }, errorGPS, { enableHighAccuracy: true });
+
+        // 10秒ごとの集計タイマー
+        timerId = setInterval(() => {
+            if (!currentPos) {
+                appendLog(`${new Date().toLocaleTimeString()} | 信号受信中...`);
+                return;
+            }
+
+            let currentDist = 0;
+            const { latitude, longitude, accuracy } = currentPos;
+
+            if (lastPos) {
+                const rawDist = getDistance(lastPos.lat, lastPos.lon, latitude, longitude);
+                
+                // ブレ対策：一定距離以上の移動時のみ加算
+                if (rawDist >= MIN_MOVEMENT) {
+                    currentDist = rawDist;
+                    totalDistance += currentDist;
+                    lastPos = { lat: latitude, lon: longitude };
+                }
+            } else {
+                lastPos = { lat: latitude, lon: longitude };
+            }
+
+            // UI更新
+            displayDist.textContent = formatDistance(totalDistance);
+            
+            const now = new Date().toLocaleTimeString();
+            appendLog(`${now} | 今回移動: ${currentDist.toFixed(1)}m | 合計: ${formatDistance(totalDistance)} (精度: ±${accuracy.toFixed(0)}m)`);
+            
+        }, 10000); 
+    };
+
+    // 一時停止ボタン
+    document.getElementById('pauseBtn').onclick = () => {
+        clearInterval(timerId); 
+        if (watchId) {
+            navigator.geolocation.clearWatch(watchId);
+            watchId = null;
+        }
+        releaseWakeLock();
+
+        // 一時停止中の移動による跳ねを防止
+        lastPos = null;
+        currentPos = null;
+
+        statusEl.textContent = "一時停止中";
+        statusEl.className = "status-badge";
+        document.getElementById('startBtn').disabled = false;
+        document.getElementById('pauseBtn').disabled = true;
+        appendLog(`[一時停止] 測定をストップしました。`);
+    };
+
+    // ストップボタン
+    document.getElementById('stopBtn').onclick = () => {
+        clearInterval(timerId);
+        if (watchId) {
+            navigator.geolocation.clearWatch(watchId);
+            watchId = null;
+        }
+        releaseWakeLock();
+
+        lastPos = null;
+        currentPos = null;
+        
+        statusEl.textContent = "測定完了";
+        statusEl.className = "status-badge";
+        document.getElementById('startBtn').disabled = false;
+        document.getElementById('pauseBtn').disabled = true;
+        document.getElementById('stopBtn').disabled = true;
+        
+        appendLog(`--- 測定終了 (最終結果: ${formatDistance(totalDistance)}) ---`);
+    };
+</script>
+</body>
+</html>
